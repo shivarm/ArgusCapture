@@ -43,6 +43,7 @@ use tokio::runtime::Builder;
 
 use crate::config::{self, AppConfig, ConfiguredCamera, Shortcuts, StorageMode};
 use crate::network::{self, NetworkCamera};
+use crate::voice;
 
 const APP_ID: &str = "org.arguscapture.ArgusCapture";
 const APP_NAME: &str = "Argus Capture";
@@ -372,6 +373,7 @@ fn build_ui(
     let quit_action = gio::SimpleAction::new("quit", None);
     let license_action = gio::SimpleAction::new("help-license", None);
     let about_action = gio::SimpleAction::new("help-about", None);
+    let voice_action = gio::SimpleAction::new("voice-listen", None);
 
     application.add_action(&license_action);
     application.add_action(&about_action);
@@ -392,6 +394,7 @@ fn build_ui(
     application.add_action(&album_videos_action);
     application.add_action(&about_action);
     application.add_action(&quit_action);
+    application.add_action(&voice_action);
 
     application.set_accels_for_action("app.quit", &["q"]);
     application.set_accels_for_action("app.camera-connect", &["c"]);
@@ -1374,6 +1377,105 @@ fn build_ui(
         });
     }
 
+    // Voice commands: press the shortcut to start listening, press it again to
+    // stop. The recording is recognized on a worker thread, and the result is
+    // routed through the same GIO actions as the menu and the shortcuts, so a
+    // disabled action (for example capture while disconnected) is ignored.
+    {
+        let application = application.clone();
+        let status_label = status_label.clone();
+        let recorder: Rc<RefCell<Option<voice::Recorder>>> = Rc::new(RefCell::new(None));
+        let recognizing = Rc::new(Cell::new(false));
+        voice_action.connect_activate(move |_, _| {
+            if recognizing.get() {
+                return;
+            }
+
+            let active_recorder = recorder.borrow_mut().take();
+            let Some(active_recorder) = active_recorder else {
+                match voice::Recorder::start() {
+                    Ok(started) => {
+                        *recorder.borrow_mut() = Some(started);
+                        status_label
+                            .set_text("Listening... press the voice shortcut again to stop.");
+                    }
+                    Err(error) => status_label.set_text(&format!("Voice input error: {error}")),
+                }
+                return;
+            };
+
+            let samples = active_recorder.finish();
+            if voice::is_probably_silence(&samples) {
+                status_label.set_text("No speech detected.");
+                return;
+            }
+
+            let downloading = !voice::is_model_cached();
+            if downloading {
+                status_label.set_text("Downloading voice model...");
+            } else {
+                status_label.set_text("Recognizing...");
+            }
+            recognizing.set(true);
+            let receiver = voice::spawn_transcription(samples);
+            let application = application.clone();
+            let status_label = status_label.clone();
+            let recognizing = recognizing.clone();
+            let _ = glib::timeout_add_local(Duration::from_millis(100), move || {
+                match receiver.try_recv() {
+                    Ok(Ok(transcript)) => {
+                        recognizing.set(false);
+                        log_live_view(format!(
+                            "voice heard {:?} ({}, {:.1}s audio, {:.2}s to recognize, RTF {:.2})",
+                            transcript.text.trim(),
+                            transcript.language,
+                            transcript.audio_seconds,
+                            transcript.elapsed.as_secs_f32(),
+                            transcript.real_time_factor(),
+                        ));
+                        match voice::parse_command(&transcript.text) {
+                            Some(command) => {
+                                status_label.set_text(&format!(
+                                    "Heard \"{}\": {}",
+                                    transcript.text.trim(),
+                                    command.label()
+                                ));
+                                application.activate_action(command.action_name(), None);
+                            }
+                            None => status_label.set_text(&format!(
+                                "Heard \"{}\": no matching voice command.",
+                                transcript.text.trim()
+                            )),
+                        }
+                        ControlFlow::Break
+                    }
+                    Ok(Err(error)) => {
+                        recognizing.set(false);
+                        status_label.set_text(&error);
+                        ControlFlow::Break
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        if !voice::is_model_cached() {
+                            let progress = voice::download_progress();
+                            if progress.total_bytes > 0 {
+                                status_label.set_text(&format!(
+                                    "Downloading voice model: {}",
+                                    progress.label()
+                                ));
+                            }
+                        }
+                        ControlFlow::Continue
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        recognizing.set(false);
+                        status_label.set_text("Speech recognition stopped unexpectedly.");
+                        ControlFlow::Break
+                    }
+                }
+            });
+        });
+    }
+
     let menu_bar = build_menu_bar_row();
     let toolbar = build_toolbar();
 
@@ -1409,6 +1511,7 @@ fn build_menu_bar_row() -> GtkBox {
     camera_menu.append(Some("Disconnect"), Some("app.camera-disconnect"));
     camera_menu.append(Some("Take Picture"), Some("app.camera-capture"));
     camera_menu.append(Some("Focus"), Some("app.camera-focus"));
+    camera_menu.append(Some("Voice Command"), Some("app.voice-listen"));
     left_root.append_submenu(Some("Camera"), &camera_menu);
 
     let menu_row = GtkBox::new(Orientation::Horizontal, 0);
