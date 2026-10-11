@@ -51,6 +51,7 @@ jobs:
             pkg-config \
             cmake \
             libglib2.0-dev \
+            libasound2-dev \
             libgtk-4-dev \
             libgphoto2-dev
       - name: Install stable toolchain
@@ -81,40 +82,18 @@ jobs:
 
   build-windows:
     runs-on: windows-latest
-    env:
-      IOLIBRARY_PATH: /ucrt64/lib
-      LIBCLANG_PATH: /ucrt64/bin
-      PKG_CONFIG_PATH: /ucrt64/lib/pkgconfig
-    defaults:
-      run:
-        shell: msys2 {0}
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install MSYS2 native dependencies
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: UCRT64
-          update: true
-          path-type: inherit
-          install: >-
-            mingw-w64-ucrt-x86_64-toolchain
-            mingw-w64-ucrt-x86_64-pkg-config
-            mingw-w64-ucrt-x86_64-libgphoto2
-            mingw-w64-ucrt-x86_64-clang
-            mingw-w64-ucrt-x86_64-gtk4
-            mingw-w64-ucrt-x86_64-cmake
-            mingw-w64-ucrt-x86_64-ninja
-
-      - name: Install stable GNU toolchain
+      - name: Install stable MSVC toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable-x86_64-pc-windows-gnu
+          target: x86_64-pc-windows-msvc
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Run cargo build
-        run: cargo build --verbose
+        run: cargo build --verbose --target x86_64-pc-windows-msvc
 
   audit:
     runs-on: ubuntu-latest
